@@ -115,7 +115,8 @@ So this is a **safety net, not a security boundary**, the same conclusion as my 
 | The hook registered in `/hooks` | `screenshots/hooks.png` |
 | Claude tries `git commit --amend` and is stopped | `screenshots/amend-blocked.png` |
 | Claude tries `docker-compose up` and is told to use `docker compose` | `screenshots/docker-compose-blocked.png` |
-| Claude tries to edit `~/.claude/settings.json` and is stopped | `screenshots/settings-blocked.png` |
+| Claude tries to write a `.claude/settings.local.json` that switches hooks off and is stopped | `screenshots/settings-blocked.png` |
+| I run `! docker-compose version` myself and it passes, since `!` never goes through the hook | `screenshots/user-bypass.png` |
 
 | Path | Contents |
 |---|---|
