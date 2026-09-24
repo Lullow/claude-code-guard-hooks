@@ -1,0 +1,129 @@
+# Guard Hooks for Claude Code
+
+A `PreToolUse` hook that stops Claude Code from running tool calls I consider dangerous: rewriting git history, destroying uncommitted work, switching off the safety net itself, and deleting Docker volumes or Kubernetes namespaces, nodes and clusters. When a call is stopped, Claude is told why and asked to let me run the command myself. That keeps me in the loop for every irreversible step.
+
+**In short**
+- One file, `guard.py`, Python standard library only.
+- 62 dangerous commands are blocked and 40 everyday commands pass in the test suite, including chains (`cd x && git push -f`), wrappers (`sudo`, `bash -c`, `eval`) and git's global flags (`git -C dir push -f`).
+- The agent cannot switch the net off: edits to `settings.json` and to the installed hook are blocked too.
+- It is a safety net, not a security boundary. Five known bypasses are documented and tested (see [Limitations](#limitations)).
+
+## Contents
+1. [How it works](#how-it-works)
+2. [What is blocked](#what-is-blocked)
+3. [When I really need a blocked command](#when-i-really-need-a-blocked-command)
+4. [Installation](#installation)
+5. [Tests](#tests)
+6. [Limitations](#limitations)
+7. [Demo](#demo)
+
+## How it works
+
+Claude Code runs the hook before every `Bash`, `Edit`, `Write`, `MultiEdit` and `NotebookEdit` call. The call arrives as JSON on stdin, and the exit code decides what happens:
+
+```
+Claude wants to run a tool
+        │
+        ▼
+Claude Code ── JSON on stdin ──▶ guard.py
+                                   │
+                                   ├── exit 0: the call runs
+                                   ├── exit 2: the call is stopped, the reason on stderr goes to Claude
+                                   └── exit 1: internal error, the call runs and I see a warning
+```
+
+For a `Bash` call, `guard.py` does four things:
+
+1. **Splits the command into words** with `shlex`. Operators (`&&`, `||`, `;`, `|`) and newlines become separate words, so every command in a chain is checked on its own. A quoted commit message stays one word, so `git commit -m "Block git push -f"` is not mistaken for a push.
+2. **Looks for watched programs anywhere** in each command: `git`, `docker`, `docker-compose`, `kubectl` and `k3d`. That catches `sudo git push -f` and `/usr/bin/git push -f` as well. The string after `bash -c` and `eval` is checked the same way.
+3. **Skips global flags** such as `git -C <dir>` or `kubectl --context <ctx>` to find the subcommand, and then checks its flags. Short flags written together (`git push -uf`) count.
+4. **Protects its own files.** Reading `settings.json` or `~/.claude/hooks` with `cat`, `grep`, `ls` and similar is fine. Anything else that mentions those paths, and every redirect (`>`) into them, is stopped.
+
+For `Edit`, `Write` and friends it checks the file path instead: `.claude/settings.json`, `.claude/settings.local.json` and everything under `~/.claude/hooks/` are off limits.
+
+**Fail-open by design.** If the hook itself crashes, it exits with 1, so the call runs and I see a warning. A bug in the safety net should not lock the agent out of every tool.
+
+## What is blocked
+
+| Group | Blocked | Why |
+|---|---|---|
+| Git history | `push --force` / `-f` / `--force-with-lease`, `+refspec`, `push --delete` / `:branch`, `push --mirror` / `--prune`, `reset --hard` / `--soft` / `HEAD~n`, `rebase`, `commit --amend`, `filter-branch`, `filter-repo`, `update-ref`, `branch -D` / `-f` / `-M`, `tag -d` / `-f` | Rewrites or deletes history, locally or on the remote |
+| Git recovery | `reflog expire` / `delete`, `gc --prune`, `prune` | Removes the last way back to lost commits |
+| Uncommitted work | `clean -f`, `checkout -- <path>` / `.`, `switch --discard-changes` / `-f`, `restore <path>` (anything but `--staged`), `stash drop` / `clear` | Throws away work that git cannot bring back |
+| The net itself | Writing to `settings.json` / `settings.local.json` in a `.claude` directory, anything in `~/.claude/hooks/`, running `install-guard.sh` | Otherwise the agent could simply switch the net off |
+| Docker | `docker-compose` (with a hyphen), `system prune`, `volume rm` / `prune`, `compose down -v` | Deletes data; the course requires `docker compose` |
+| Kubernetes | `kubectl delete namespace` / `node`, `kubectl delete --all` / `-A`, `kubectl drain`, `k3d cluster` / `node` / `registry delete` | Tears down everything running in a namespace, on a node or in the cluster |
+
+Everyday commands still work: `git status`, `git push`, `git reset HEAD <file>`, `git restore --staged`, `git checkout -b`, `docker compose up` / `down`, `kubectl apply` / `delete -f`, and so on. The full lists are in `test_guard.py`.
+
+The Docker and Kubernetes rules are there for the next two assignments (a chatbot in Docker and a k3s cluster), which I build with this hook active.
+
+## When I really need a blocked command
+
+I run it myself with the `!` prefix in Claude Code, e.g. `! git rebase -i HEAD~3`. The command then runs in my own shell and never passes through the hook. The block message tells Claude to ask me to do exactly that, instead of looking for another way around the block.
+
+## Installation
+
+```bash
+./install-guard.sh
+```
+
+The script runs the tests and copies `guard.py` to `~/.claude/hooks/guard.py`. Then add the block in `settings.example.json` to `~/.claude/settings.json` (merge it with any hooks already there) and check with `/hooks` in Claude Code.
+
+**Why a copy and not a path into the repo?** The agent may edit and test `guard.py` in this repo freely, but the active copy in `~/.claude/hooks/` is protected. A new version only becomes active when I run the install script myself.
+
+**Order matters.** Copy the file first, then add the settings block. If the file is missing, `python3` exits with code 2 ("can't open file"), and Claude Code reads that as "block", so every tool call would be stopped.
+
+## Tests
+
+```bash
+python3 -m unittest -v
+```
+
+No packages to install. The tests are table-driven:
+
+- `BLOCKED`: 62 commands that must be stopped
+- `ALLOWED`: 40 everyday commands that must pass
+- `KNOWN_BYPASSES`: 5 commands that get through, to keep [Limitations](#limitations) honest
+- file-path rules for `Edit` and `Write`
+- the protocol itself: `guard.py` is run as a subprocess with JSON on stdin, and the tests check exit code 2 and the stderr message, exit 0 for harmless calls, and exit 1 for broken input
+
+## Limitations
+
+The hook reads the text of a command. It does not know what the command will actually do, so anything that hides the text gets through:
+
+| Bypass | Example |
+|---|---|
+| Encoding | `echo Z2l0IHB1c2ggLWY= \| base64 -d \| bash` |
+| Git aliases | `git config alias.pf "push -f" && git pf` |
+| Scripts the agent writes itself | `./scripts/force-push.sh` |
+| Other languages | `python3 -c "import os; os.system('git push -f')"` |
+| Variables | `X="push -f"; git $X` |
+
+There are also gaps and false positives:
+
+- `git reset <sha>` without `~` or `^` is allowed, because a commit hash cannot be told apart from a file name.
+- `$(...)` inside double quotes is not checked, so that commit messages written with a heredoc are not mistaken for commands.
+- `man git rebase` is blocked, and so is writing any `settings.json` through `Bash`, even outside `.claude`. When in doubt the hook blocks.
+
+So this is a **safety net, not a security boundary**, the same conclusion as my earlier guardrails assignment. It stops the agent from doing something destructive *by mistake*, which is the common case. The real boundaries lie elsewhere: branch protection on GitHub (enforced by the server), `permissions.deny` rules in Claude Code, a sandbox, and not giving the agent credentials it does not need.
+
+## Demo
+
+| | |
+|---|---|
+| The hook registered in `/hooks` | `screenshots/hooks.png` |
+| Claude tries `git commit --amend` and is stopped | `screenshots/amend-blocked.png` |
+| Claude tries `docker-compose up` and is told to use `docker compose` | `screenshots/docker-compose-blocked.png` |
+| Claude tries to edit `~/.claude/settings.json` and is stopped | `screenshots/settings-blocked.png` |
+
+| Path | Contents |
+|---|---|
+| `guard.py` | The hook |
+| `test_guard.py` | The tests |
+| `install-guard.sh` | Runs the tests and installs the hook |
+| `settings.example.json` | The block for `~/.claude/settings.json` |
+
+---
+
+*Built as assignment 6 in the Machine Learning 2 course at Teknikhögskolan Stockholm, September 2026. The code comments and the messages Claude sees are written in Swedish.*
