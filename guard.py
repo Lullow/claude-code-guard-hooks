@@ -3,7 +3,10 @@
 
 Claude Code skickar varje tool-call som JSON på stdin innan den körs.
 Exit 2 stoppar anropet, och texten på stderr visas för Claude som förklaring.
-Exit 0 släpper igenom.
+Exit 0 släpper igenom. Ett tredje svar, "fråga användaren", skrivs som JSON på
+stdout med exit 0: Claude Code visar då en fråga och användaren bestämmer.
+Trasig indata eller en bugg i hooken stoppar anropet (fail-closed), eftersom
+ett kommando som får hooken att krascha annars skulle slinka igenom.
 
 Reglerna gäller tre saker:
   1. git-kommandon som skriver om historik eller förstör osparat arbete
@@ -21,8 +24,13 @@ TAIL = ("Försök inte ta dig runt spärren. Behövs kommandot verkligen: "
 
 HOOKS_DIR = Path.home() / ".claude" / "hooks"
 SETTINGS_NAMES = {"settings.json", "settings.local.json"}
-READ_ONLY = {"cat", "less", "head", "tail", "grep", "ls", "stat", "wc", "diff", "file", "jq"}
+READ_ONLY = {"cat", "less", "head", "tail", "grep", "ls", "stat", "wc", "diff", "cmp", "md5sum",
+             "sha256sum", "file", "jq", "realpath", "readlink", "du"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
+
+
+class Ask(str):
+    """Ett skäl som ska bli en fråga till användaren i stället för ett nej."""
 
 GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
 DOCKER_OPTS_WITH_VALUE = {"-H", "--host", "-c", "--context", "--config", "-l", "--log-level"}
@@ -121,10 +129,10 @@ def check_git(args):
         moves_branch = any(c in a for a in rest if not a.startswith("-") for c in ("~", "^", "@{"))
         if has_flag(rest, "", ("--hard", "--soft", "--merge", "--keep")) or moves_branch:
             return "`git reset` som flyttar grenen eller slänger ändringar skriver om historik"
-    if sub == "rebase":
-        return "`git rebase` skriver om historik"
+    if sub == "rebase":  # lokalt och går att ångra via reflog: fråga i stället för att neka
+        return Ask("`git rebase` skriver om historik")
     if sub == "commit" and has_flag(rest, "", ("--amend",)):
-        return "`git commit --amend` skriver om den senaste commiten"
+        return Ask("`git commit --amend` skriver om den senaste commiten")
     if sub in ("filter-branch", "filter-repo", "update-ref", "prune"):
         return f"`git {sub}` skriver om eller raderar historik"
     if sub == "branch" and has_flag(rest, "DfM", ("--force",)):
@@ -204,6 +212,27 @@ CHECKERS = {
     "k3d": check_k3d,
     "install-guard.sh": check_install_guard,
 }
+OPTS_WITH_VALUE = {"git": GIT_OPTS_WITH_VALUE, "docker": DOCKER_OPTS_WITH_VALUE,
+                   "kubectl": KUBECTL_OPTS_WITH_VALUE}
+
+
+def check_variable_subcommand(name, args):
+    """`git $X`: ett underkommando i en variabel går inte att granska."""
+    sub, _ = split_subcommand(args, OPTS_WITH_VALUE.get(name, set()))
+    if sub and sub.startswith("$"):
+        return f"`{name} {sub}` har underkommandot i en variabel och går inte att granska"
+    return None
+
+
+def check_shell(args):
+    """`bash -c "..."` granskas som ett kommando. Ett skal utan skript, som i `... | bash`,
+    kör vad som helst från stdin och går inte att granska."""
+    for i, arg in enumerate(args[:-1]):
+        if arg.startswith("-") and not arg.startswith("--") and "c" in arg:
+            return check_bash(args[i + 1])
+    if not any(not arg.startswith("-") for arg in args):
+        return "ett skal utan skript (som i `... | bash`) kör vad som helst från stdin"
+    return None
 
 
 # --- Säkerhetsnätets egna filer ------------------------------------------------
@@ -214,14 +243,23 @@ def mentions_protected(word):
     return ".claude/hooks" in word or os.path.basename(word.rstrip("/")) in SETTINGS_NAMES
 
 
+def writes_protected(words):
+    """Sant om en omdirigering (> eller >>) pekar på en skyddad fil. `2>&1` och `> /tmp/x` gör inte det."""
+    return any(is_redirect(word) and i + 1 < len(words) and mentions_protected(words[i + 1])
+               for i, word in enumerate(words))
+
+
+def reads_only(words):
+    """Sant för `cat`, `grep`, `ls` och liknande, så länge inget omdirigeras till en skyddad fil.
+    Ett sådant kommando får nämna vad som helst: `cat install-guard.sh`, `grep docker-compose x`."""
+    return os.path.basename(words[0]) in READ_ONLY and not writes_protected(words)
+
+
 def check_protected_mention(words):
     """Bash får läsa settings och hooks, men inte ändra dem."""
-    if not any(mentions_protected(w) for w in words):
-        return None
-    reads_only = os.path.basename(words[0]) in READ_ONLY and not any(is_redirect(w) for w in words)
-    if reads_only:
-        return None
-    return "kommandot kan ändra säkerhetsnätet (settings.json eller ~/.claude/hooks)"
+    if any(mentions_protected(w) for w in words):
+        return "kommandot kan ändra säkerhetsnätet (settings.json eller ~/.claude/hooks)"
+    return None
 
 
 def is_protected_path(path, cwd):
@@ -239,15 +277,12 @@ def check_segment(words):
         name = os.path.basename(word)
         rest = words[i + 1:]
         reason = None
-        if name in SHELLS:  # bash -c "git push -f"
-            for j, arg in enumerate(rest[:-1]):
-                if arg.startswith("-") and not arg.startswith("--") and "c" in arg:
-                    reason = check_bash(rest[j + 1])
-                    break
+        if name in SHELLS:  # bash -c "git push -f", eller ... | bash
+            reason = check_shell(rest)
         elif name == "eval":
             reason = check_bash(" ".join(rest))
         elif name in CHECKERS:
-            reason = CHECKERS[name](rest)
+            reason = check_variable_subcommand(name, rest) or CHECKERS[name](rest)
         if reason:
             return reason
     return None
@@ -255,6 +290,8 @@ def check_segment(words):
 
 def check_bash(command):
     for words in segments(tokenize(command)):
+        if reads_only(words):
+            continue
         reason = check_protected_mention(words) or check_segment(words)
         if reason:
             return reason
@@ -276,9 +313,15 @@ def main():
     try:
         call = json.load(sys.stdin)
         reason = check(call.get("tool_name", ""), call.get("tool_input") or {}, call.get("cwd") or ".")
-    except Exception as error:  # en bugg här ska inte låsa agenten helt
-        print(f"guard.py: internt fel, anropet släpps igenom: {error!r}", file=sys.stderr)
-        return 1
+    except Exception as error:  # trasig indata eller en bugg: stoppa hellre än att släppa igenom
+        print(f"Stoppad av säkerhetsnätet: internt fel i hooken, {error!r}.\n{TAIL}", file=sys.stderr)
+        return 2
+    if isinstance(reason, Ask):
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": f"Säkerhetsnätet frågar: {reason}."}}, ensure_ascii=False))
+        return 0
     if reason:
         print(f"Stoppad av säkerhetsnätet: {reason}.\n{TAIL}", file=sys.stderr)
         return 2
